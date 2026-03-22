@@ -188,7 +188,17 @@ def try_sync(
                 offset_samples / float(SAMPLE_RATE) + args.apply_offset_seconds
             )
             scale_step = best_srt_pipe.named_steps["scale"]
-            logger.info("score: %.3f", best_score)
+            speech_extractor = best_srt_pipe.named_steps.get("speech_extract")
+            speech_arr = getattr(speech_extractor, "subtitle_speech_results_", None)
+            normalized_score = (
+                best_score / len(speech_arr)
+                if speech_arr is not None and len(speech_arr) > 0
+                else None
+            )
+            if normalized_score is not None:
+                logger.info("score: %.3f (%.1f%%)", best_score, normalized_score * 100)
+            else:
+                logger.info("score: %.3f", best_score)
             logger.info("offset seconds: %.3f", offset_seconds)
             logger.info("framerate scale factor: %.3f", scale_step.scale_factor)
             output_steps: List[Tuple[str, TransformerMixin]] = [
@@ -204,8 +214,37 @@ def try_sync(
                 out_subs = out_subs.set_encoding(args.output_encoding)
             suppress_output_thresh = args.suppress_output_if_offset_less_than
             if offset_seconds >= (suppress_output_thresh or float("-inf")):
-                logger.info("writing output to {}".format(srtout or "stdout"))
-                out_subs.write_file(srtout)
+                bad_threshold = getattr(args, "bad_sync_threshold", None)
+                skip_write = False
+                score_for_threshold = (
+                    normalized_score if normalized_score is not None else best_score
+                )
+                if (
+                    bad_threshold is not None
+                    and bad_threshold > 0
+                    and score_for_threshold < bad_threshold
+                ):
+                    will_overwrite = srtout is not None and os.path.exists(srtout)
+                    if will_overwrite and not args.gui_mode and not args.vlc_mode:
+                        logger.warning(
+                            "WARNING: alignment score %.1f%% is below --bad-sync-threshold %.1f%%; "
+                            "subtitles may not match the reference (e.g. wrong episode).",
+                            score_for_threshold * 100,
+                            bad_threshold * 100,
+                        )
+                        response = (
+                            input("Proceed with overwrite of '%s'? [y/N]: " % srtout)
+                            .strip()
+                            .lower()
+                        )
+                        if response not in ("y", "yes"):
+                            logger.warning(
+                                "Skipping write due to suspicious alignment score."
+                            )
+                            skip_write = True
+                if not skip_write:
+                    logger.info("writing output to {}".format(srtout or "stdout"))
+                    out_subs.write_file(srtout)
             else:
                 logger.warning(
                     "suppressing output because offset %s was less than suppression threshold %s",
@@ -218,6 +257,8 @@ def try_sync(
         else:
             result["offset_seconds"] = offset_seconds
             result["framerate_scale_factor"] = scale_step.scale_factor
+            result["score"] = best_score
+            result["score_normalized"] = normalized_score
     result["sync_was_successful"] = sync_was_successful
     return sync_was_successful
 
@@ -514,6 +555,8 @@ def run(
         "retval": 0,
         "offset_seconds": None,
         "framerate_scale_factor": None,
+        "score": None,
+        "score_normalized": None,
     }
     args = validate_and_transform_args(parser_or_args)
     if args is None:
@@ -714,6 +757,18 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=None,
         help="If specified, do not produce output if offset below provided threshold.",
+    )
+    parser.add_argument(
+        "--bad-sync-threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "If the normalized alignment score is below this value (0.0-1.0), warn and "
+            "ask for confirmation before overwriting a file. "
+            "Good matches typically score 0.5+ (50%%+); scores below this threshold "
+            "can indicate subtitles from the wrong source (e.g. a switched episode). "
+            "Set to 0 to disable. Default: 0.4 (40%%)."
+        ),
     )
     parser.add_argument(
         "--ffmpeg-path",
