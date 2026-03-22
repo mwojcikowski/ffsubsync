@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime
 import logging
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -523,6 +524,25 @@ def validate_and_transform_args(
     else:
         parser = parser_or_args
         args = parser.parse_args()
+    if (
+        not args.srtin
+        and args.reference is not None
+        and args.extract_subs_from_stream is None
+    ):
+        ref = Path(args.reference)
+        candidates = sorted(ref.parent.glob(ref.stem + "*.srt"))
+        if len(candidates) == 1:
+            args.srtin = [str(candidates[0])]
+            logger.info(
+                "no input subtitle specified; auto-detected: %s",
+                args.srtin[0],
+            )
+        elif len(candidates) > 1:
+            logger.warning(
+                "no input subtitle specified and multiple candidates found (%s); "
+                "please specify one with -i",
+                ", ".join(str(p) for p in candidates),
+            )
     try:
         validate_args(args)
     except ValueError as e:
