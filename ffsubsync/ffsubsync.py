@@ -307,8 +307,13 @@ def try_sync_by_text(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
         model_name = getattr(args, "text_align_model", DEFAULT_TEXT_ALIGN_MODEL)
         threshold = getattr(args, "text_align_threshold", DEFAULT_TEXT_ALIGN_THRESHOLD)
 
+        stats: Dict[str, Any] = {}
         new_subs = align_subtitles_by_content(
-            ref_subs, target_subs, model_name=model_name, threshold=threshold
+            ref_subs,
+            target_subs,
+            model_name=model_name,
+            threshold=threshold,
+            out_stats=stats,
         )
 
         out_subs_file = target_subs_file.clone_props_for_subs(new_subs)
@@ -316,6 +321,32 @@ def try_sync_by_text(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
             out_subs_file = out_subs_file.set_encoding(args.output_encoding)
 
         srtout = srtin if args.overwrite_input else args.srtout
+        bad_threshold = getattr(args, "bad_sync_threshold", None)
+        match_ratio = stats.get("match_ratio", 1.0)
+        if (
+            bad_threshold is not None
+            and bad_threshold > 0
+            and match_ratio < bad_threshold
+            and srtout is not None
+            and os.path.exists(srtout)
+            and not args.gui_mode
+            and not args.vlc_mode
+        ):
+            logger.warning(
+                "WARNING: text-alignment match ratio %.1f%% is below "
+                "--bad-sync-threshold %.1f%%; subtitles may not match the reference.",
+                match_ratio * 100,
+                bad_threshold * 100,
+            )
+            response = (
+                input("Proceed with overwrite of '%s'? [y/N]: " % srtout)
+                .strip()
+                .lower()
+            )
+            if response not in ("y", "yes"):
+                logger.warning("Skipping write due to low text-alignment match ratio.")
+                result["sync_was_successful"] = False
+                return False
         logger.info("writing output to %s", srtout or "stdout")
         out_subs_file.write_file(srtout)
         result["sync_was_successful"] = True
@@ -389,16 +420,53 @@ def try_pgs_ocr(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
             threshold = getattr(
                 args, "text_align_threshold", DEFAULT_TEXT_ALIGN_THRESHOLD
             )
+            ocr_stats: Dict[str, Any] = {}
             aligned_subs = align_subtitles_by_content(
-                ref_subs, target_subs, model_name=model_name, threshold=threshold
+                ref_subs,
+                target_subs,
+                model_name=model_name,
+                threshold=threshold,
+                out_stats=ocr_stats,
             )
 
             # 4. Write output preserving the target file's format/encoding
             out_file = target_subs_file.clone_props_for_subs(aligned_subs)
             if args.output_encoding != "same":
                 out_file = out_file.set_encoding(args.output_encoding)
-            logger.info("writing aligned output to %s", args.srtout or "stdout")
-            out_file.write_file(args.srtout)
+            srtout = srtin if args.overwrite_input else args.srtout
+            if srtout is None:
+                srtout = os.path.splitext(srtin)[0] + ".synced.srt"
+                logger.info("auto-detected output path: %s", srtout)
+            bad_threshold = getattr(args, "bad_sync_threshold", None)
+            match_ratio = ocr_stats.get("match_ratio", 1.0)
+            if (
+                bad_threshold is not None
+                and bad_threshold > 0
+                and match_ratio < bad_threshold
+                and srtout is not None
+                and os.path.exists(srtout)
+                and not args.gui_mode
+                and not args.vlc_mode
+            ):
+                logger.warning(
+                    "WARNING: text-alignment match ratio %.1f%% is below "
+                    "--bad-sync-threshold %.1f%%; subtitles may not match the reference.",
+                    match_ratio * 100,
+                    bad_threshold * 100,
+                )
+                response = (
+                    input("Proceed with overwrite of '%s'? [y/N]: " % srtout)
+                    .strip()
+                    .lower()
+                )
+                if response not in ("y", "yes"):
+                    logger.warning(
+                        "Skipping write due to low text-alignment match ratio."
+                    )
+                    result["sync_was_successful"] = False
+                    return False
+            logger.info("writing aligned output to %s", srtout)
+            out_file.write_file(srtout)
             result["sync_was_successful"] = True
             return True
 
@@ -406,6 +474,10 @@ def try_pgs_ocr(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
         srtout = args.srtout
         if srtout is None and args.srtin:
             srtout = args.srtin[0]
+        if srtout is None:
+            # Auto-derive output path from the reference filename
+            srtout = os.path.splitext(args.reference)[0] + ".srt"
+            logger.info("auto-detected output path: %s", srtout)
 
         ref = args.reference
         if ref is not None and ref.lower().endswith(".sup"):
@@ -623,18 +695,9 @@ def validate_args(args: argparse.Namespace) -> None:
                     "--pgs-ocr --text-align requires an input subtitle file (-i), "
                     "e.g. polish_unaligned.srt"
                 )
-            if args.srtout is None:
-                raise ValueError(
-                    "--pgs-ocr --text-align requires an output file (-o / --srtout)"
-                )
         else:
             if args.reference is None:
                 raise ValueError("--pgs-ocr requires a reference video or .sup file")
-            if args.srtout is None and not (args.srtin and args.overwrite_input):
-                raise ValueError(
-                    "--pgs-ocr requires an output file (-o / --srtout) "
-                    "or --overwrite-input with an input file"
-                )
 
 
 def validate_file_permissions(args: argparse.Namespace) -> None:
@@ -989,7 +1052,7 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--bad-sync-threshold",
         type=float,
-        default=0.5,
+        default=0.7,
         help=(
             "If the normalized alignment score is below this value (0.0-1.0), warn and "
             "ask for confirmation before overwriting a file. "

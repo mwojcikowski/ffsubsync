@@ -11,7 +11,7 @@ import copy
 import logging
 import re
 from datetime import timedelta
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -209,21 +209,28 @@ def compute_global_offset(
     target_subs: list,
     ref_subs: list,
     matches: List[Tuple[int, int]],
+    trim_pct: float = 5.0,
 ) -> timedelta:
     """Compute a single global time offset from all matched subtitle pairs.
 
     For each matched pair ``(target_idx, ref_idx)`` the offset is
-    ``ref.start - target.start``.  The **median** of all such offsets is
-    returned as a robust estimate of the single global time shift.  If there
-    are no matches a zero offset is returned.
+    ``ref.start - target.start``.  The extreme *trim_pct* percent on each
+    tail (default 5 %) are discarded before computing the mean, making the
+    estimate robust against OCR errors or badly matched outliers while using
+    more of the signal than a plain median.  Falls back to the median when
+    fewer than 4 matches remain after trimming.  If there are no matches a
+    zero offset is returned.
     """
     if not matches:
         return timedelta(0)
-    offsets_s = [
+    offsets_s = sorted(
         (ref_subs[ri].start - target_subs[ti].start).total_seconds()
         for ti, ri in matches
-    ]
-    return timedelta(seconds=float(np.median(offsets_s)))
+    )
+    n = len(offsets_s)
+    cut = int(n * trim_pct / 100.0)
+    trimmed = offsets_s[cut : n - cut] if n - 2 * cut >= 4 else offsets_s
+    return timedelta(seconds=float(np.mean(trimmed)))
 
 
 def apply_offset(
@@ -274,6 +281,7 @@ def align_subtitles_by_content(
     model_name: str = DEFAULT_MODEL,
     threshold: float = DEFAULT_THRESHOLD,
     min_subtitle_duration_s: float = 1.0,
+    out_stats: Optional[Dict[str, Any]] = None,
 ) -> list:
     """Align target subtitles to reference timestamps via cross-lingual similarity.
 
@@ -339,6 +347,11 @@ def align_subtitles_by_content(
             "issues or mismatched subtitle files.",
             match_ratio * 100,
         )
+
+    if out_stats is not None:
+        out_stats["match_count"] = matched_count
+        out_stats["total_count"] = len(target_list)
+        out_stats["match_ratio"] = match_ratio
 
     offset = compute_global_offset(target_list, ref_list, matches)
     logger.info("global offset: %+.3f s", offset.total_seconds())

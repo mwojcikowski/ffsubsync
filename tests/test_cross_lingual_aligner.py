@@ -204,8 +204,9 @@ class TestComputeGlobalOffset:
         offset = compute_global_offset(self._pl(), self._en(), [(0, 0)])
         assert abs(offset.total_seconds() - 2.0) < 1e-6
 
-    def test_two_matches_median(self):
-        # pair (0,0): 10.0 - 8.0 = 2.0 s; pair (1,1): 12.0 - 9.0 = 3.0 s → median = 2.5
+    def test_two_matches_mean(self):
+        # pair (0,0): 10.0 - 8.0 = 2.0 s; pair (1,1): 12.0 - 9.0 = 3.0 s
+        # Only 2 samples → fallback to mean of all = 2.5
         offset = compute_global_offset(self._pl(), self._en(), [(0, 0), (1, 1)])
         assert abs(offset.total_seconds() - 2.5) < 1e-6
 
