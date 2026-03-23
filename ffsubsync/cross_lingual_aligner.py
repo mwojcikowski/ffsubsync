@@ -17,7 +17,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+DEFAULT_MODEL = "sentence-transformers/LaBSE"
 DEFAULT_THRESHOLD = 0.3
 
 
