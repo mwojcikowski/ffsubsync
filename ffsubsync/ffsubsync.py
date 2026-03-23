@@ -34,6 +34,11 @@ from ffsubsync.speech_transformers import (
     PGSSpeechTransformer,
     make_subtitle_speech_pipeline,
 )
+from ffsubsync.cross_lingual_aligner import (
+    align_subtitles_by_content,
+    DEFAULT_MODEL as DEFAULT_TEXT_ALIGN_MODEL,
+    DEFAULT_THRESHOLD as DEFAULT_TEXT_ALIGN_THRESHOLD,
+)
 from ffsubsync.subtitle_parser import make_subtitle_parser
 from ffsubsync.subtitle_transformers import SubtitleMerger, SubtitleShifter
 from ffsubsync.version import get_version
@@ -264,6 +269,57 @@ def try_sync(
     return sync_was_successful
 
 
+def try_sync_by_text(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
+    """Assign timestamps from a reference subtitle file to a target subtitle file
+    using cross-lingual sentence embeddings and monotone DP alignment."""
+    result["sync_was_successful"] = False
+    try:
+        ref_format = os.path.splitext(args.reference)[-1][1:]
+        ref_parser = make_subtitle_parser(
+            fmt=ref_format,
+            encoding=args.reference_encoding or DEFAULT_ENCODING,
+            max_subtitle_seconds=args.max_subtitle_seconds,
+            start_seconds=args.start_seconds,
+            strict=args.strict,
+        )
+        ref_parser.fit(args.reference)
+        ref_subs = list(ref_parser.subs_)
+
+        srtin = args.srtin[0]
+        target_format = os.path.splitext(srtin)[-1][1:]
+        target_parser = make_subtitle_parser(
+            fmt=target_format,
+            encoding=args.encoding,
+            max_subtitle_seconds=args.max_subtitle_seconds,
+            start_seconds=args.start_seconds,
+            strict=args.strict,
+        )
+        target_parser.fit(srtin)
+        target_subs_file = target_parser.subs_
+        target_subs = list(target_subs_file)
+
+        model_name = getattr(args, "text_align_model", DEFAULT_TEXT_ALIGN_MODEL)
+        threshold = getattr(args, "text_align_threshold", DEFAULT_TEXT_ALIGN_THRESHOLD)
+
+        new_subs = align_subtitles_by_content(
+            ref_subs, target_subs, model_name=model_name, threshold=threshold
+        )
+
+        out_subs_file = target_subs_file.clone_props_for_subs(new_subs)
+        if args.output_encoding != "same":
+            out_subs_file = out_subs_file.set_encoding(args.output_encoding)
+
+        srtout = srtin if args.overwrite_input else args.srtout
+        logger.info("writing output to %s", srtout or "stdout")
+        out_subs_file.write_file(srtout)
+        result["sync_was_successful"] = True
+        return True
+    except Exception:
+        logger.exception("failed to align subtitles by content")
+        result["sync_was_successful"] = False
+        return False
+
+
 def make_reference_pipe(args: argparse.Namespace) -> Pipeline:
     pgs_stream = getattr(args, "pgs_ref_stream", None)
     if pgs_stream is not None:
@@ -431,6 +487,17 @@ def validate_args(args: argparse.Namespace) -> None:
                 "stream specified for reference subtitle extraction; "
                 "-i flag for sync input not allowed"
             )
+    if getattr(args, "text_align", False):
+        if args.reference is None:
+            raise ValueError("--text-align requires a reference subtitle file")
+        ref_fmt = _ref_format(args.reference)
+        if ref_fmt not in SUBTITLE_EXTENSIONS:
+            raise ValueError(
+                "--text-align requires the reference to be a subtitle file "
+                "(srt/ass/ssa/sub/vtt), got: %s" % ref_fmt
+            )
+        if not args.srtin:
+            raise ValueError("--text-align requires an input subtitle file (-i)")
 
 
 def validate_file_permissions(args: argparse.Namespace) -> None:
@@ -489,6 +556,8 @@ def _npy_savename(args: argparse.Namespace) -> str:
 
 
 def _run_impl(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
+    if getattr(args, "text_align", False):
+        return try_sync_by_text(args, result)
     if args.extract_subs_from_stream is not None:
         result["retval"] = extract_subtitles_from_reference(args)
         return True
@@ -814,6 +883,35 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
         "--strict",
         action="store_true",
         help="If specified, refuse to parse srt files with formatting issues.",
+    )
+    parser.add_argument(
+        "--text-align",
+        action="store_true",
+        help=(
+            "If specified, align target subtitles to reference subtitles using "
+            "cross-lingual sentence embeddings instead of audio/speech timing. "
+            "Useful when you have an English SRT (reference) and a Polish SRT "
+            "(e.g. OCR'd from PGS Blu-ray) and want to assign the correct "
+            "English timestamps to the Polish lines. "
+            "Requires 'sentence-transformers' to be installed."
+        ),
+    )
+    parser.add_argument(
+        "--text-align-model",
+        default=DEFAULT_TEXT_ALIGN_MODEL,
+        help=(
+            "Multilingual sentence-transformers model to use for --text-align "
+            "(default=%s)." % DEFAULT_TEXT_ALIGN_MODEL
+        ),
+    )
+    parser.add_argument(
+        "--text-align-threshold",
+        type=float,
+        default=DEFAULT_TEXT_ALIGN_THRESHOLD,
+        help=(
+            "Minimum cosine similarity for a subtitle pair to be accepted as a match "
+            "during --text-align (default=%.1f)." % DEFAULT_TEXT_ALIGN_THRESHOLD
+        ),
     )
     parser.add_argument("--vlc-mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--gui-mode", action="store_true", help=argparse.SUPPRESS)
