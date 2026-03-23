@@ -28,6 +28,17 @@ def _strip_tags(text: str) -> str:
     return " ".join(text.split())
 
 
+def _is_informative(text: str, min_chars: int = 20, min_words: int = 4) -> bool:
+    """Return True if *text* is long enough to produce a reliable embedding.
+
+    Short lines like "Yes.", "No.", "Wait!" embed almost identically across
+    languages and pollute the offset estimate with false matches.  Lines that
+    exceed *either* threshold are kept.
+    """
+    clean = _strip_tags(text).strip()
+    return len(clean) >= min_chars or len(clean.split()) >= min_words
+
+
 class CrossLingualEmbedder:
     """Wraps sentence-transformers for multilingual subtitle embedding.
 
@@ -287,12 +298,17 @@ def align_subtitles_by_content(
 
     The algorithm:
 
-    1. Embed both subtitle lists with a multilingual sentence-transformers model.
-    2. Build a cosine-similarity matrix and run monotone DP alignment.
-    3. Derive a **single global time offset** (median of per-match offsets).
-    4. Shift **all** target subtitles by that offset (preserving their original
-       relative timing and durations).
-    5. Enforce a minimum subtitle duration of *min_subtitle_duration_s* seconds
+    1. Filter both lists to *informative* lines (≥ 20 chars **or** ≥ 4 words
+       after tag-stripping).  Short lines like "Yes." / "Tak." produce
+       unreliable cross-lingual matches and are excluded from matching.
+    2. Embed the filtered lists with a multilingual sentence-transformers model.
+    3. Build a cosine-similarity matrix and run monotone DP alignment on the
+       filtered lists; remap matched indices back to the original lists.
+    4. Derive a **single global time offset** (5 %-trimmed mean of per-match
+       offsets).
+    5. Shift **all** target subtitles (including short ones) by that offset,
+       preserving their original relative timing and durations.
+    6. Enforce a minimum subtitle duration of *min_subtitle_duration_s* seconds
        so that language-split lines are never shorter than 1 s.
 
     Parameters
@@ -321,24 +337,53 @@ def align_subtitles_by_content(
         len(ref_list),
     )
 
+    # Filter to informative lines for embedding / DP; keep original indices for
+    # remapping back after alignment.
+    ref_idx = [i for i, s in enumerate(ref_list) if _is_informative(s.content)]
+    target_idx = [i for i, s in enumerate(target_list) if _is_informative(s.content)]
+    ref_filtered = [ref_list[i] for i in ref_idx]
+    target_filtered = [target_list[i] for i in target_idx]
+    logger.info(
+        "informative lines: %d / %d ref, %d / %d target",
+        len(ref_filtered),
+        len(ref_list),
+        len(target_filtered),
+        len(target_list),
+    )
+
+    # Fall back to full lists if filtering leaves too little to work with.
+    if len(ref_filtered) < 4 or len(target_filtered) < 4:
+        logger.warning(
+            "too few informative lines after filtering (%d ref, %d target); "
+            "using all lines for alignment",
+            len(ref_filtered),
+            len(target_filtered),
+        )
+        ref_filtered, target_filtered = ref_list, target_list
+        ref_idx = list(range(len(ref_list)))
+        target_idx = list(range(len(target_list)))
+
     embedder = CrossLingualEmbedder(model_name)
     logger.info("embedding reference subtitles...")
-    ref_embeddings = embedder.embed([sub.content for sub in ref_list])
+    ref_embeddings = embedder.embed([sub.content for sub in ref_filtered])
     logger.info("embedding target subtitles...")
-    target_embeddings = embedder.embed([sub.content for sub in target_list])
+    target_embeddings = embedder.embed([sub.content for sub in target_filtered])
 
     logger.info("computing cross-lingual similarity matrix...")
     S = cosine_similarity_matrix(target_embeddings, ref_embeddings)
 
     logger.info("running monotone DP alignment...")
-    matches = dp_monotone_align(S, threshold=threshold)
+    filtered_matches = dp_monotone_align(S, threshold=threshold)
+
+    # Remap filtered-list indices back to original-list indices.
+    matches = [(target_idx[ti], ref_idx[ri]) for ti, ri in filtered_matches]
 
     matched_count = len(matches)
-    match_ratio = matched_count / len(target_list) if target_list else 0.0
+    match_ratio = matched_count / len(target_filtered) if target_filtered else 0.0
     logger.info(
-        "matched %d / %d target lines (%.1f%%)",
+        "matched %d / %d informative target lines (%.1f%%)",
         matched_count,
-        len(target_list),
+        len(target_filtered),
         match_ratio * 100,
     )
     if match_ratio < 0.4:
