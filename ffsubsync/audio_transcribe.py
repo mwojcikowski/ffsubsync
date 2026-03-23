@@ -72,10 +72,13 @@ def extract_audio(
         "fatal",
         "-i",
         video_path,
-        "-vn",         # drop video
-        "-ac", "1",    # mono
-        "-ar", "16000",  # 16 kHz
-        "-f", "wav",
+        "-vn",  # drop video
+        "-ac",
+        "1",  # mono
+        "-ar",
+        "16000",  # 16 kHz
+        "-f",
+        "wav",
         output_audio,
     ]
     logger.info("extracting audio from %s...", video_path)
