@@ -1,5 +1,7 @@
 auditok==0.1.5
 chardet;python_version>='3.7'
+faster-whisper
+mlx-whisper; sys_platform == "darwin"
 ocrmac; sys_platform == "darwin"
 Pillow>=9.0.0
 sentence-transformers>=2.2.0

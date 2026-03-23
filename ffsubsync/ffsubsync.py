@@ -45,6 +45,13 @@ from ffsubsync.pgs_ocr import (
     pgs_to_generic_subs as _pgs_to_generic_subs,
     sup_to_generic_subs as _sup_to_generic_subs,
 )
+from ffsubsync.audio_transcribe import (
+    transcribe_to_srt as _transcribe_to_srt,
+    transcribe_to_generic_subs as _transcribe_to_generic_subs,
+    DEFAULT_WHISPER_MODEL,
+    DEFAULT_WHISPER_LANGUAGE,
+    DEFAULT_WHISPER_BACKEND,
+)
 from ffsubsync.subtitle_parser import make_subtitle_parser
 from ffsubsync.subtitle_transformers import SubtitleMerger, SubtitleShifter
 from ffsubsync.version import get_version
@@ -353,6 +360,134 @@ def try_sync_by_text(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
         return True
     except Exception:
         logger.exception("failed to align subtitles by content")
+        result["sync_was_successful"] = False
+        return False
+
+
+def try_transcribe(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
+    """Transcribe audio from the reference video and write an SRT.
+
+    When ``--text-align`` is also set:
+      - ``reference`` = video whose audio will be transcribed (English).
+      - ``srtin[0]`` (-i) = unaligned target SRT (e.g. Polish).
+      - Transcribed subs are used as the reference for cross-lingual alignment.
+    """
+    result["sync_was_successful"] = False
+    try:
+        model_name = getattr(args, "transcribe_model", DEFAULT_WHISPER_MODEL)
+        language = getattr(args, "transcribe_lang", DEFAULT_WHISPER_LANGUAGE)
+        if language == "auto":
+            language = None
+        backend = getattr(args, "transcribe_backend", DEFAULT_WHISPER_BACKEND)
+
+        if getattr(args, "text_align", False):
+            # Combined mode:
+            #   reference = video to transcribe → English subs with timestamps
+            #   srtin[0]  = unaligned target SRT (Polish) to assign timestamps to
+            srtin = args.srtin[0]
+            logger.info("combined transcribe + text-align mode")
+            logger.info("transcribe source : %s", args.reference)
+            logger.info("target to align   : %s", srtin)
+
+            # 1. Transcribe the audio → reference subs with timestamps
+            ref_subs = _transcribe_to_generic_subs(
+                args.reference,
+                model_name=model_name,
+                language=language,
+                backend=backend,
+                ffmpeg_path=args.ffmpeg_path,
+                gui_mode=args.gui_mode,
+            )
+
+            # 2. Parse the unaligned target SRT
+            target_format = os.path.splitext(srtin)[-1][1:]
+            target_parser = make_subtitle_parser(
+                fmt=target_format,
+                encoding=args.encoding,
+                max_subtitle_seconds=args.max_subtitle_seconds,
+                start_seconds=args.start_seconds,
+                strict=args.strict,
+            )
+            target_parser.fit(srtin)
+            target_subs_file = target_parser.subs_
+            target_subs = list(target_subs_file)
+
+            # 3. Cross-lingual alignment
+            model_text = getattr(args, "text_align_model", DEFAULT_TEXT_ALIGN_MODEL)
+            threshold = getattr(
+                args, "text_align_threshold", DEFAULT_TEXT_ALIGN_THRESHOLD
+            )
+            asr_stats: Dict[str, Any] = {}
+            aligned_subs = align_subtitles_by_content(
+                ref_subs,
+                target_subs,
+                model_name=model_text,
+                threshold=threshold,
+                out_stats=asr_stats,
+            )
+
+            # 4. Write output
+            out_file = target_subs_file.clone_props_for_subs(aligned_subs)
+            if args.output_encoding != "same":
+                out_file = out_file.set_encoding(args.output_encoding)
+            srtout = srtin if args.overwrite_input else args.srtout
+            if srtout is None:
+                srtout = os.path.splitext(srtin)[0] + ".synced.srt"
+                logger.info("auto-detected output path: %s", srtout)
+            bad_threshold = getattr(args, "bad_sync_threshold", None)
+            match_ratio = asr_stats.get("match_ratio", 1.0)
+            if (
+                bad_threshold is not None
+                and bad_threshold > 0
+                and match_ratio < bad_threshold
+                and srtout is not None
+                and os.path.exists(srtout)
+                and not args.gui_mode
+                and not args.vlc_mode
+            ):
+                logger.warning(
+                    "WARNING: text-alignment match ratio %.1f%% is below "
+                    "--bad-sync-threshold %.1f%%; subtitles may not match the reference.",
+                    match_ratio * 100,
+                    bad_threshold * 100,
+                )
+                response = (
+                    input("Proceed with overwrite of '%s'? [y/N]: " % srtout)
+                    .strip()
+                    .lower()
+                )
+                if response not in ("y", "yes"):
+                    logger.warning(
+                        "Skipping write due to low text-alignment match ratio."
+                    )
+                    result["sync_was_successful"] = False
+                    return False
+            logger.info("writing aligned output to %s", srtout)
+            out_file.write_file(srtout)
+            result["sync_was_successful"] = True
+            return True
+
+        # Plain transcribe-only mode: write SRT alongside the reference file
+        srtout = args.srtout
+        if srtout is None and args.srtin:
+            srtout = args.srtin[0]
+        if srtout is None:
+            srtout = os.path.splitext(args.reference)[0] + ".srt"
+            logger.info("auto-detected output path: %s", srtout)
+        n = _transcribe_to_srt(
+            args.reference,
+            srtout,
+            model_name=model_name,
+            language=language,
+            backend=backend,
+            ffmpeg_path=args.ffmpeg_path,
+            gui_mode=args.gui_mode,
+        )
+        logger.info("wrote %d subtitle entries to %s", n, srtout)
+        result["sync_was_successful"] = True
+        return True
+    except Exception:
+        logger.exception("transcription failed")
         result["sync_was_successful"] = False
         return False
 
@@ -669,7 +804,11 @@ def validate_args(args: argparse.Namespace) -> None:
                 "stream specified for reference subtitle extraction; "
                 "-i flag for sync input not allowed"
             )
-    if getattr(args, "text_align", False) and not getattr(args, "pgs_ocr", False):
+    if (
+        getattr(args, "text_align", False)
+        and not getattr(args, "pgs_ocr", False)
+        and not getattr(args, "transcribe", False)
+    ):
         if args.reference is None:
             raise ValueError("--text-align requires a reference subtitle file")
         ref_fmt = _ref_format(args.reference)
@@ -698,6 +837,14 @@ def validate_args(args: argparse.Namespace) -> None:
         else:
             if args.reference is None:
                 raise ValueError("--pgs-ocr requires a reference video or .sup file")
+    if getattr(args, "transcribe", False):
+        if args.reference is None:
+            raise ValueError("--transcribe requires a reference video file")
+        if getattr(args, "text_align", False) and not args.srtin:
+            raise ValueError(
+                "--transcribe --text-align requires an input subtitle file (-i), "
+                "e.g. polish_unaligned.srt"
+            )
 
 
 def validate_file_permissions(args: argparse.Namespace) -> None:
@@ -756,6 +903,8 @@ def _npy_savename(args: argparse.Namespace) -> str:
 
 
 def _run_impl(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
+    if getattr(args, "transcribe", False):
+        return try_transcribe(args, result)
     if getattr(args, "pgs_ocr", False):
         return try_pgs_ocr(args, result)
     if getattr(args, "text_align", False):
@@ -1152,6 +1301,48 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vlc-mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--gui-mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--skip-sync", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--transcribe",
+        action="store_true",
+        help=(
+            "Transcribe the audio track of the reference video using Whisper and "
+            "write an SRT file. When combined with --text-align, the transcribed "
+            "subtitles are used as the reference for cross-lingual alignment against "
+            "the input SRT (-i). "
+            "Requires: pip install faster-whisper  (or mlx-whisper on Apple Silicon)"
+        ),
+    )
+    parser.add_argument(
+        "--transcribe-model",
+        default=DEFAULT_WHISPER_MODEL,
+        metavar="MODEL",
+        help=(
+            "Whisper model size for --transcribe: tiny, base, small, medium, "
+            "large-v3, or a full HuggingFace repo id (default=%s)."
+            % DEFAULT_WHISPER_MODEL
+        ),
+    )
+    parser.add_argument(
+        "--transcribe-lang",
+        default=DEFAULT_WHISPER_LANGUAGE,
+        metavar="LANG",
+        help=(
+            "ISO 639-1 language code for --transcribe (default=%s). "
+            "Pass 'auto' to let Whisper auto-detect the language."
+            % DEFAULT_WHISPER_LANGUAGE
+        ),
+    )
+    parser.add_argument(
+        "--transcribe-backend",
+        default=DEFAULT_WHISPER_BACKEND,
+        choices=["faster-whisper", "mlx-whisper"],
+        help=(
+            "Transcription backend for --transcribe. "
+            "'faster-whisper' (default) runs on CPU via CTranslate2, cross-platform. "
+            "'mlx-whisper' uses Apple MLX for GPU/ANE on Apple Silicon "
+            "(pip install mlx-whisper). (default=%s)" % DEFAULT_WHISPER_BACKEND
+        ),
+    )
 
 
 def make_parser() -> argparse.ArgumentParser:
