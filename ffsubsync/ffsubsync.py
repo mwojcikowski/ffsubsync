@@ -39,6 +39,7 @@ from ffsubsync.cross_lingual_aligner import (
     DEFAULT_MODEL as DEFAULT_TEXT_ALIGN_MODEL,
     DEFAULT_THRESHOLD as DEFAULT_TEXT_ALIGN_THRESHOLD,
 )
+from ffsubsync.pgs_ocr import pgs_to_srt as _pgs_to_srt, sup_to_srt as _sup_to_srt
 from ffsubsync.subtitle_parser import make_subtitle_parser
 from ffsubsync.subtitle_transformers import SubtitleMerger, SubtitleShifter
 from ffsubsync.version import get_version
@@ -320,6 +321,43 @@ def try_sync_by_text(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
         return False
 
 
+def try_pgs_ocr(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
+    """Extract PGS track, OCR each bitmap frame, write SRT."""
+    result["sync_was_successful"] = False
+    try:
+        sup_path = getattr(args, "pgs_ocr_dump_sup", None)
+        pngs_dir = getattr(args, "pgs_ocr_dump_pngs", None)
+        language = getattr(args, "pgs_ocr_lang", "pl-PL")
+        stream = getattr(args, "pgs_ref_stream", None)
+        if stream == "auto":
+            stream = None
+        srtout = args.srtout
+        if srtout is None and args.srtin:
+            srtout = args.srtin[0]
+
+        ref = args.reference
+        if ref is not None and ref.lower().endswith(".sup"):
+            n = _sup_to_srt(ref, srtout, language=language, dump_pngs_dir=pngs_dir)
+        else:
+            n = _pgs_to_srt(
+                ref,
+                stream=stream,
+                output_srt=srtout,
+                language=language,
+                ffmpeg_path=args.ffmpeg_path,
+                gui_mode=args.gui_mode,
+                dump_sup=sup_path,
+                dump_pngs_dir=pngs_dir,
+            )
+        logger.info("wrote %d subtitle entries to %s", n, srtout)
+        result["sync_was_successful"] = True
+        return True
+    except Exception:
+        logger.exception("PGS OCR failed")
+        result["sync_was_successful"] = False
+        return False
+
+
 def make_reference_pipe(args: argparse.Namespace) -> Pipeline:
     pgs_stream = getattr(args, "pgs_ref_stream", None)
     if pgs_stream is not None:
@@ -498,6 +536,14 @@ def validate_args(args: argparse.Namespace) -> None:
             )
         if not args.srtin:
             raise ValueError("--text-align requires an input subtitle file (-i)")
+    if getattr(args, "pgs_ocr", False):
+        if args.reference is None:
+            raise ValueError("--pgs-ocr requires a reference video or .sup file")
+        if args.srtout is None and not (args.srtin and args.overwrite_input):
+            raise ValueError(
+                "--pgs-ocr requires an output file (-o / --srtout) "
+                "or --overwrite-input with an input file"
+            )
 
 
 def validate_file_permissions(args: argparse.Namespace) -> None:
@@ -558,6 +604,8 @@ def _npy_savename(args: argparse.Namespace) -> str:
 def _run_impl(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
     if getattr(args, "text_align", False):
         return try_sync_by_text(args, result)
+    if getattr(args, "pgs_ocr", False):
+        return try_pgs_ocr(args, result)
     if args.extract_subs_from_stream is not None:
         result["retval"] = extract_subtitles_from_reference(args)
         return True
@@ -911,6 +959,40 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Minimum cosine similarity for a subtitle pair to be accepted as a match "
             "during --text-align (default=%.1f)." % DEFAULT_TEXT_ALIGN_THRESHOLD
+        ),
+    )
+    parser.add_argument(
+        "--pgs-ocr",
+        action="store_true",
+        help=(
+            "Extract a PGS (bitmap) subtitle track from the reference video or a "
+            "pre-existing .sup file, OCR each frame with ocrmac (macOS Vision), "
+            "and write an SRT whose timecodes come directly from the PGS stream. "
+            "Requires: pip install ocrmac Pillow"
+        ),
+    )
+    parser.add_argument(
+        "--pgs-ocr-lang",
+        default="pl-PL",
+        metavar="LANG",
+        help=(
+            "BCP-47 language tag for ocrmac recognition during --pgs-ocr "
+            "(default=pl-PL). Examples: en-US, de-DE, fr-FR."
+        ),
+    )
+    parser.add_argument(
+        "--pgs-ocr-dump-sup",
+        default=None,
+        metavar="PATH",
+        help="If specified with --pgs-ocr, keep the extracted .sup stream at PATH.",
+    )
+    parser.add_argument(
+        "--pgs-ocr-dump-pngs",
+        default=None,
+        metavar="DIR",
+        help=(
+            "If specified with --pgs-ocr, save each subtitle bitmap as a numbered "
+            "PNG in DIR (created if it does not exist). Useful for inspection."
         ),
     )
     parser.add_argument("--vlc-mode", action="store_true", help=argparse.SUPPRESS)
