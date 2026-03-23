@@ -1,5 +1,6 @@
 auditok==0.1.5
 chardet;python_version>='3.7'
+sentence-transformers>=2.2.0
 charset_normalizer
 faust-cchardet;python_version<'3.13'
 ffmpeg-python
