@@ -472,6 +472,8 @@ def _sup_to_srt(
     dump_pngs_dir: Optional[str],
 ) -> int:
     """Iterate display sets, render, OCR, write SRT.  Returns entry count."""
+    import tqdm
+
     if dump_pngs_dir:
         os.makedirs(dump_pngs_dir, exist_ok=True)
 
@@ -506,20 +508,30 @@ def _sup_to_srt(
             )
         )
 
-    for ds in display_sets:
-        if ds.is_clear:
-            if pending is not None:
-                _process(pending, ds.pts)
-                pending = None
-        else:
-            if pending is not None:
-                # Back-to-back non-clear sets: previous ends at the new PTS
-                _process(pending, ds.pts)
-            pending = ds
+    with tqdm.tqdm(
+        total=len(display_sets),
+        desc="OCR PGS",
+        unit="frame",
+        dynamic_ncols=True,
+    ) as pbar:
+        for ds in display_sets:
+            pbar.update(1)
+            if ds.is_clear:
+                if pending is not None:
+                    _process(pending, ds.pts)
+                    pending = None
+                    pbar.set_postfix(subtitles=len(entries))
+            else:
+                if pending is not None:
+                    # Back-to-back non-clear sets: previous ends at the new PTS
+                    _process(pending, ds.pts)
+                    pbar.set_postfix(subtitles=len(entries))
+                pending = ds
 
-    # Trailing non-clear set with no following clear event
-    if pending is not None:
-        _process(pending, pending.pts + 3.0)
+        # Trailing non-clear set with no following clear event
+        if pending is not None:
+            _process(pending, pending.pts + 3.0)
+            pbar.set_postfix(subtitles=len(entries))
 
     logger.info("OCR produced %d subtitle entries", len(entries))
     with open(output_srt, "w", encoding="utf-8") as f:
@@ -570,11 +582,19 @@ def ocr_pngs_to_srt(
             % (len(pngs), len(timings))
         )
 
+    import tqdm
+
     entries: List[srt.Subtitle] = []
-    for i, (png_path, (start_s, end_s)) in enumerate(zip(pngs, timings), 1):
+    for png_path, (start_s, end_s) in tqdm.tqdm(
+        zip(pngs, timings),
+        total=len(pngs),
+        desc="OCR PNGs",
+        unit="img",
+        dynamic_ncols=True,
+    ):
         img = PilImage.open(png_path).convert("RGBA")
         text = ocr_image(img, language).strip()
-        logger.debug("[%d/%d] %s -> %r", i, len(pngs), os.path.basename(png_path), text)
+        logger.debug("%s -> %r", os.path.basename(png_path), text)
         if text:
             entries.append(
                 srt.Subtitle(
