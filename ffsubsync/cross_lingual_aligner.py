@@ -205,28 +205,104 @@ def assign_timestamps(
     return result
 
 
+def compute_global_offset(
+    target_subs: list,
+    ref_subs: list,
+    matches: List[Tuple[int, int]],
+) -> timedelta:
+    """Compute a single global time offset from all matched subtitle pairs.
+
+    For each matched pair ``(target_idx, ref_idx)`` the offset is
+    ``ref.start - target.start``.  The **median** of all such offsets is
+    returned as a robust estimate of the single global time shift.  If there
+    are no matches a zero offset is returned.
+    """
+    if not matches:
+        return timedelta(0)
+    offsets_s = [
+        (ref_subs[ri].start - target_subs[ti].start).total_seconds()
+        for ti, ri in matches
+    ]
+    return timedelta(seconds=float(np.median(offsets_s)))
+
+
+def apply_offset(
+    target_subs: list,
+    offset: timedelta,
+    min_duration_s: float = 1.0,
+) -> list:
+    """Shift every target subtitle by *offset* and enforce a minimum duration.
+
+    Parameters
+    ----------
+    target_subs:
+        Subtitles whose timestamps will be shifted.
+    offset:
+        Global time offset to add to every start/end.
+    min_duration_s:
+        Minimum subtitle duration in seconds.  Subtitles shorter than this
+        (which can happen when language differences split one reference line
+        into multiple target lines) have their end time extended to meet the
+        minimum.  Set to 0 to disable the clamp.
+
+    Returns
+    -------
+    New list of ``GenericSubtitle`` with shifted timestamps and original content.
+    """
+    from ffsubsync.generic_subtitles import GenericSubtitle  # avoid circular import
+
+    min_dur = timedelta(seconds=min_duration_s)
+    result = []
+    for sub in target_subs:
+        new_start = sub.start + offset
+        new_end = sub.end + offset
+        # Keep timestamps non-negative
+        if new_start.total_seconds() < 0:
+            new_start = timedelta(0)
+        if new_end < new_start:
+            new_end = new_start
+        # Enforce minimum display duration
+        if new_end - new_start < min_dur:
+            new_end = new_start + min_dur
+        result.append(GenericSubtitle(new_start, new_end, copy.deepcopy(sub.inner)))
+    return result
+
+
 def align_subtitles_by_content(
     ref_subs,
     target_subs,
     model_name: str = DEFAULT_MODEL,
     threshold: float = DEFAULT_THRESHOLD,
+    min_subtitle_duration_s: float = 1.0,
 ) -> list:
-    """Assign reference SRT timestamps to target subtitles via cross-lingual alignment.
+    """Align target subtitles to reference timestamps via cross-lingual similarity.
+
+    The algorithm:
+
+    1. Embed both subtitle lists with a multilingual sentence-transformers model.
+    2. Build a cosine-similarity matrix and run monotone DP alignment.
+    3. Derive a **single global time offset** (median of per-match offsets).
+    4. Shift **all** target subtitles by that offset (preserving their original
+       relative timing and durations).
+    5. Enforce a minimum subtitle duration of *min_subtitle_duration_s* seconds
+       so that language-split lines are never shorter than 1 s.
 
     Parameters
     ----------
     ref_subs:
-        Reference subtitles with correct timestamps (e.g. English ``GenericSubtitle`` list).
+        Reference subtitles with correct timestamps (e.g. English OCR'd PGS).
     target_subs:
-        Target subtitles whose timestamps need to be assigned (e.g. Polish OCR'd from PGS).
+        Target subtitles whose timestamps need to be corrected (e.g. Polish SRT).
     model_name:
         Multilingual ``sentence-transformers`` model name.
     threshold:
         Minimum cosine similarity for a match to be accepted (default 0.3).
+    min_subtitle_duration_s:
+        Minimum display duration for every output subtitle in seconds (default 1.0).
 
     Returns
     -------
-    List of ``GenericSubtitle`` with reference timestamps and original target text.
+    List of ``GenericSubtitle`` with corrected timestamps and original target text.
     """
     ref_list = list(ref_subs)
     target_list = list(target_subs)
@@ -264,4 +340,6 @@ def align_subtitles_by_content(
             match_ratio * 100,
         )
 
-    return assign_timestamps(target_list, ref_list, matches)
+    offset = compute_global_offset(target_list, ref_list, matches)
+    logger.info("global offset: %+.3f s", offset.total_seconds())
+    return apply_offset(target_list, offset, min_duration_s=min_subtitle_duration_s)

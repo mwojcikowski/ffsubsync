@@ -10,6 +10,8 @@ from ffsubsync.cross_lingual_aligner import (
     cosine_similarity_matrix,
     dp_monotone_align,
     assign_timestamps,
+    compute_global_offset,
+    apply_offset,
     align_subtitles_by_content,
 )
 from ffsubsync.generic_subtitles import GenericSubtitle
@@ -181,6 +183,77 @@ class TestAssignTimestamps:
 
 
 # ---------------------------------------------------------------------------
+# compute_global_offset
+# ---------------------------------------------------------------------------
+
+
+class TestComputeGlobalOffset:
+    def _en(self):
+        return [
+            _make_sub(1, 10.0, 11.0, "Hello"),
+            _make_sub(2, 12.0, 13.0, "World"),
+        ]
+
+    def _pl(self):
+        return [
+            _make_sub(1, 8.0, 8.5, "Cześć"),
+            _make_sub(2, 9.0, 9.5, "Świat"),
+        ]
+
+    def test_single_match_exact_offset(self):
+        offset = compute_global_offset(self._pl(), self._en(), [(0, 0)])
+        assert abs(offset.total_seconds() - 2.0) < 1e-6
+
+    def test_two_matches_median(self):
+        # pair (0,0): 10.0 - 8.0 = 2.0 s; pair (1,1): 12.0 - 9.0 = 3.0 s → median = 2.5
+        offset = compute_global_offset(self._pl(), self._en(), [(0, 0), (1, 1)])
+        assert abs(offset.total_seconds() - 2.5) < 1e-6
+
+    def test_no_matches_returns_zero(self):
+        offset = compute_global_offset(self._pl(), self._en(), [])
+        assert offset == timedelta(0)
+
+
+# ---------------------------------------------------------------------------
+# apply_offset
+# ---------------------------------------------------------------------------
+
+
+class TestApplyOffset:
+    def _subs(self):
+        return [
+            _make_sub(1, 1.0, 1.3, "Short"),
+            _make_sub(2, 5.0, 6.5, "Normal"),
+        ]
+
+    def test_offset_applied_to_all(self):
+        result = apply_offset(self._subs(), timedelta(seconds=3.0))
+        assert result[0].start == timedelta(seconds=4.0)
+        assert result[1].start == timedelta(seconds=8.0)
+
+    def test_min_duration_clamped(self):
+        # First sub is 0.3 s → should be extended to 1.0 s
+        result = apply_offset(self._subs(), timedelta(0), min_duration_s=1.0)
+        assert result[0].end - result[0].start == timedelta(seconds=1.0)
+        # Second sub is already 1.5 s → untouched
+        assert abs((result[1].end - result[1].start).total_seconds() - 1.5) < 1e-6
+
+    def test_text_preserved(self):
+        result = apply_offset(self._subs(), timedelta(seconds=1.0))
+        assert result[0].content == "Short"
+        assert result[1].content == "Normal"
+
+    def test_negative_offset_clamped_to_zero(self):
+        # Offset pushes start before 0 → clamp to 0
+        result = apply_offset(self._subs(), timedelta(seconds=-5.0), min_duration_s=0)
+        assert result[0].start == timedelta(0)
+
+    def test_count_preserved(self):
+        result = apply_offset(self._subs(), timedelta(seconds=2.0))
+        assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
 # align_subtitles_by_content (requires sentence-transformers)
 # ---------------------------------------------------------------------------
 
@@ -211,9 +284,16 @@ class TestAlignSubtitlesByContent:
     def test_timestamps_assigned_within_reference_range(self):
         result = align_subtitles_by_content(self._build_en(), self._build_pl())
         assert len(result) == 3
+        # Global offset applied: all subs should start within the reference window
         for sub in result:
-            assert sub.start >= timedelta(seconds=1.0)
-            assert sub.end <= timedelta(seconds=7.0)
+            assert sub.start >= timedelta(seconds=0.0)
+            assert sub.end >= timedelta(seconds=1.0)  # at least 1 s duration
+
+    def test_minimum_duration_enforced(self):
+        result = align_subtitles_by_content(self._build_en(), self._build_pl())
+        for sub in result:
+            duration = (sub.end - sub.start).total_seconds()
+            assert duration >= 1.0, f"subtitle too short: {duration:.3f}s"
 
     def test_polish_text_preserved(self):
         result = align_subtitles_by_content(self._build_en(), self._build_pl())
