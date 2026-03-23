@@ -39,7 +39,12 @@ from ffsubsync.cross_lingual_aligner import (
     DEFAULT_MODEL as DEFAULT_TEXT_ALIGN_MODEL,
     DEFAULT_THRESHOLD as DEFAULT_TEXT_ALIGN_THRESHOLD,
 )
-from ffsubsync.pgs_ocr import pgs_to_srt as _pgs_to_srt, sup_to_srt as _sup_to_srt
+from ffsubsync.pgs_ocr import (
+    pgs_to_srt as _pgs_to_srt,
+    sup_to_srt as _sup_to_srt,
+    pgs_to_generic_subs as _pgs_to_generic_subs,
+    sup_to_generic_subs as _sup_to_generic_subs,
+)
 from ffsubsync.subtitle_parser import make_subtitle_parser
 from ffsubsync.subtitle_transformers import SubtitleMerger, SubtitleShifter
 from ffsubsync.version import get_version
@@ -322,15 +327,82 @@ def try_sync_by_text(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
 
 
 def try_pgs_ocr(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
-    """Extract PGS track, OCR each bitmap frame, write SRT."""
+    """Extract PGS track, OCR each bitmap frame, write SRT.
+
+    When ``--text-align`` is also set:
+      - ``reference`` (first positional arg) = video / .sup file containing the
+        PGS track to OCR (e.g. an MKV with English PGS subtitles).
+      - ``srtin[0]`` (-i) = unaligned target SRT (e.g. Polish, wrong timestamps).
+      - The OCR'd PGS subs are used as the *reference* for cross-lingual alignment
+        and their timestamps are assigned to the target lines.
+    """
     result["sync_was_successful"] = False
     try:
         sup_path = getattr(args, "pgs_ocr_dump_sup", None)
         pngs_dir = getattr(args, "pgs_ocr_dump_pngs", None)
-        language = getattr(args, "pgs_ocr_lang", "pl-PL")
+        language = getattr(args, "pgs_ocr_lang", "en-US")
         stream = getattr(args, "pgs_ref_stream", None)
         if stream == "auto":
             stream = None
+
+        if getattr(args, "text_align", False):
+            # Combined mode:
+            #   reference = video/sup to OCR → English subs with PGS timestamps
+            #   srtin[0]  = unaligned target SRT (Polish) to assign timestamps to
+            pgs_source = args.reference
+            srtin = args.srtin[0]
+            logger.info("combined PGS-OCR + text-align mode")
+            logger.info("OCR source (PGS)  : %s", pgs_source)
+            logger.info("target to align   : %s", srtin)
+
+            # 1. OCR the PGS track → reference subs with timestamps
+            if pgs_source.lower().endswith(".sup"):
+                ref_subs = _sup_to_generic_subs(
+                    pgs_source, language=language, dump_pngs_dir=pngs_dir
+                )
+            else:
+                ref_subs = _pgs_to_generic_subs(
+                    pgs_source,
+                    stream=stream,
+                    language=language,
+                    ffmpeg_path=args.ffmpeg_path,
+                    gui_mode=args.gui_mode,
+                    dump_sup=sup_path,
+                    dump_pngs_dir=pngs_dir,
+                )
+
+            # 2. Parse the unaligned target SRT
+            target_format = os.path.splitext(srtin)[-1][1:]
+            target_parser = make_subtitle_parser(
+                fmt=target_format,
+                encoding=args.encoding,
+                max_subtitle_seconds=args.max_subtitle_seconds,
+                start_seconds=args.start_seconds,
+                strict=args.strict,
+            )
+            target_parser.fit(srtin)
+            target_subs_file = target_parser.subs_
+            target_subs = list(target_subs_file)
+
+            # 3. Cross-lingual alignment: assigns PGS timestamps to target lines
+            model_name = getattr(args, "text_align_model", DEFAULT_TEXT_ALIGN_MODEL)
+            threshold = getattr(
+                args, "text_align_threshold", DEFAULT_TEXT_ALIGN_THRESHOLD
+            )
+            aligned_subs = align_subtitles_by_content(
+                ref_subs, target_subs, model_name=model_name, threshold=threshold
+            )
+
+            # 4. Write output preserving the target file's format/encoding
+            out_file = target_subs_file.clone_props_for_subs(aligned_subs)
+            if args.output_encoding != "same":
+                out_file = out_file.set_encoding(args.output_encoding)
+            logger.info("writing aligned output to %s", args.srtout or "stdout")
+            out_file.write_file(args.srtout)
+            result["sync_was_successful"] = True
+            return True
+
+        # Plain OCR-only mode: reference = video/sup, srtout = output SRT
         srtout = args.srtout
         if srtout is None and args.srtin:
             srtout = args.srtin[0]
@@ -525,7 +597,7 @@ def validate_args(args: argparse.Namespace) -> None:
                 "stream specified for reference subtitle extraction; "
                 "-i flag for sync input not allowed"
             )
-    if getattr(args, "text_align", False):
+    if getattr(args, "text_align", False) and not getattr(args, "pgs_ocr", False):
         if args.reference is None:
             raise ValueError("--text-align requires a reference subtitle file")
         ref_fmt = _ref_format(args.reference)
@@ -537,13 +609,32 @@ def validate_args(args: argparse.Namespace) -> None:
         if not args.srtin:
             raise ValueError("--text-align requires an input subtitle file (-i)")
     if getattr(args, "pgs_ocr", False):
-        if args.reference is None:
-            raise ValueError("--pgs-ocr requires a reference video or .sup file")
-        if args.srtout is None and not (args.srtin and args.overwrite_input):
-            raise ValueError(
-                "--pgs-ocr requires an output file (-o / --srtout) "
-                "or --overwrite-input with an input file"
-            )
+        if getattr(args, "text_align", False):
+            # Combined mode:
+            #   reference = video/sup with PGS to OCR (e.g. movie.mkv or english.sup)
+            #   srtin[0]  = unaligned target SRT (e.g. polish.srt)
+            if args.reference is None:
+                raise ValueError(
+                    "--pgs-ocr --text-align requires a reference video or .sup file "
+                    "(first positional arg, e.g. movie.mkv)"
+                )
+            if not args.srtin:
+                raise ValueError(
+                    "--pgs-ocr --text-align requires an input subtitle file (-i), "
+                    "e.g. polish_unaligned.srt"
+                )
+            if args.srtout is None:
+                raise ValueError(
+                    "--pgs-ocr --text-align requires an output file (-o / --srtout)"
+                )
+        else:
+            if args.reference is None:
+                raise ValueError("--pgs-ocr requires a reference video or .sup file")
+            if args.srtout is None and not (args.srtin and args.overwrite_input):
+                raise ValueError(
+                    "--pgs-ocr requires an output file (-o / --srtout) "
+                    "or --overwrite-input with an input file"
+                )
 
 
 def validate_file_permissions(args: argparse.Namespace) -> None:
@@ -602,10 +693,10 @@ def _npy_savename(args: argparse.Namespace) -> str:
 
 
 def _run_impl(args: argparse.Namespace, result: Dict[str, Any]) -> bool:
-    if getattr(args, "text_align", False):
-        return try_sync_by_text(args, result)
     if getattr(args, "pgs_ocr", False):
         return try_pgs_ocr(args, result)
+    if getattr(args, "text_align", False):
+        return try_sync_by_text(args, result)
     if args.extract_subs_from_stream is not None:
         result["retval"] = extract_subtitles_from_reference(args)
         return True
@@ -973,11 +1064,11 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--pgs-ocr-lang",
-        default="pl-PL",
+        default="en-US",
         metavar="LANG",
         help=(
             "BCP-47 language tag for ocrmac recognition during --pgs-ocr "
-            "(default=pl-PL). Examples: en-US, de-DE, fr-FR."
+            "(default=en-US). Examples: en-US, de-DE, fr-FR."
         ),
     )
     parser.add_argument(

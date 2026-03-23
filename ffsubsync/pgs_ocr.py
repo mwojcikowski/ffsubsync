@@ -465,13 +465,12 @@ def sup_to_srt(
     return _sup_to_srt(sup_path, output_srt, language, dump_pngs_dir)
 
 
-def _sup_to_srt(
+def _ocr_sup_to_timings(
     sup_path: str,
-    output_srt: str,
     language: str,
     dump_pngs_dir: Optional[str],
-) -> int:
-    """Iterate display sets, render, OCR, write SRT.  Returns entry count."""
+) -> List[Tuple[float, float, str]]:
+    """Shared OCR loop: parse .sup, render, OCR, return (start_s, end_s, text) list."""
     import tqdm
 
     if dump_pngs_dir:
@@ -480,7 +479,7 @@ def _sup_to_srt(
     display_sets = list(iter_pgs_display_sets(sup_path))
     logger.info("parsed %d display sets from %s", len(display_sets), sup_path)
 
-    entries: List[srt.Subtitle] = []
+    results: List[Tuple[float, float, str]] = []
     pending: Optional[_DisplaySet] = None
     frame_idx = 0
 
@@ -497,16 +496,8 @@ def _sup_to_srt(
             img.save(png_path)
             logger.debug("saved %s", png_path)
         text = ocr_image(img, language).strip()
-        if not text:
-            return
-        entries.append(
-            srt.Subtitle(
-                index=len(entries) + 1,
-                start=timedelta(seconds=ds_show.pts),
-                end=timedelta(seconds=end_pts),
-                content=text,
-            )
-        )
+        if text:
+            results.append((ds_show.pts, end_pts, text))
 
     with tqdm.tqdm(
         total=len(display_sets),
@@ -520,24 +511,104 @@ def _sup_to_srt(
                 if pending is not None:
                     _process(pending, ds.pts)
                     pending = None
-                    pbar.set_postfix(subtitles=len(entries))
+                    pbar.set_postfix(subtitles=len(results))
             else:
                 if pending is not None:
                     # Back-to-back non-clear sets: previous ends at the new PTS
                     _process(pending, ds.pts)
-                    pbar.set_postfix(subtitles=len(entries))
+                    pbar.set_postfix(subtitles=len(results))
                 pending = ds
 
         # Trailing non-clear set with no following clear event
         if pending is not None:
             _process(pending, pending.pts + 3.0)
-            pbar.set_postfix(subtitles=len(entries))
+            pbar.set_postfix(subtitles=len(results))
 
-    logger.info("OCR produced %d subtitle entries", len(entries))
+    logger.info("OCR produced %d subtitle entries", len(results))
+    return results
+
+
+def _sup_to_srt(
+    sup_path: str,
+    output_srt: str,
+    language: str,
+    dump_pngs_dir: Optional[str],
+) -> int:
+    """Iterate display sets, render, OCR, write SRT.  Returns entry count."""
+    timings = _ocr_sup_to_timings(sup_path, language, dump_pngs_dir)
+    entries = [
+        srt.Subtitle(
+            index=i + 1,
+            start=timedelta(seconds=start_s),
+            end=timedelta(seconds=end_s),
+            content=text,
+        )
+        for i, (start_s, end_s, text) in enumerate(timings)
+    ]
     with open(output_srt, "w", encoding="utf-8") as f:
         f.write(srt.compose(entries))
     logger.info("wrote SRT -> %s", output_srt)
     return len(entries)
+
+
+def _sup_to_generic_subs(sup_path: str, language: str, dump_pngs_dir: Optional[str]):
+    """OCR a .sup file and return the results as a list of GenericSubtitle.
+
+    The timestamps on the returned subtitles come directly from the PGS stream.
+    This is the building block for the combined PGS-OCR + cross-lingual-align
+    pipeline that avoids writing an intermediate SRT file.
+    """
+    from ffsubsync.generic_subtitles import GenericSubtitle
+
+    timings = _ocr_sup_to_timings(sup_path, language, dump_pngs_dir)
+    subs = []
+    for i, (start_s, end_s, text) in enumerate(timings):
+        start = timedelta(seconds=start_s)
+        end = timedelta(seconds=end_s)
+        inner = srt.Subtitle(index=i + 1, start=start, end=end, content=text)
+        subs.append(GenericSubtitle(start, end, inner))
+    return subs
+
+
+def pgs_to_generic_subs(
+    fname: str,
+    stream: Optional[str],
+    language: str = "pl-PL",
+    ffmpeg_path: Optional[str] = None,
+    gui_mode: bool = False,
+    dump_sup: Optional[str] = None,
+    dump_pngs_dir: Optional[str] = None,
+):
+    """Extract PGS from *fname*, OCR, return list of GenericSubtitle.
+
+    Equivalent to :func:`pgs_to_srt` but returns in-memory subtitles instead
+    of writing a file.  Use this when you want to feed the result directly into
+    :func:`ffsubsync.cross_lingual_aligner.align_subtitles_by_content`.
+    """
+    if stream is None:
+        stream = find_pgs_stream(fname, ffmpeg_path, gui_mode)
+        if stream is None:
+            raise ValueError("No hdmv_pgs_subtitle stream found in %s" % fname)
+    if not stream.startswith("0:"):
+        stream = "0:" + stream
+
+    own_sup = dump_sup is None
+    sup_path = dump_sup if dump_sup is not None else tempfile.mktemp(suffix=".sup")
+    try:
+        extract_sup_stream(fname, stream, sup_path, ffmpeg_path, gui_mode)
+        return _sup_to_generic_subs(sup_path, language, dump_pngs_dir)
+    finally:
+        if own_sup and os.path.exists(sup_path):
+            os.remove(sup_path)
+
+
+def sup_to_generic_subs(
+    sup_path: str,
+    language: str = "pl-PL",
+    dump_pngs_dir: Optional[str] = None,
+):
+    """OCR a pre-existing ``.sup`` file and return a list of GenericSubtitle."""
+    return _sup_to_generic_subs(sup_path, language, dump_pngs_dir)
 
 
 # ---------------------------------------------------------------------------
