@@ -241,7 +241,7 @@ def compute_global_offset(
     n = len(offsets_s)
     cut = int(n * trim_pct / 100.0)
     trimmed = offsets_s[cut : n - cut] if n - 2 * cut >= 4 else offsets_s
-    return timedelta(seconds=float(np.mean(trimmed)))
+    return timedelta(seconds=float(np.median(trimmed)))
 
 
 def apply_offset(
